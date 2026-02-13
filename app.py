@@ -6,10 +6,7 @@ import heapq
 import re
 from urllib.parse import unquote, quote
 from collections import deque, defaultdict
-import concurrent.futures
 import networkx as nx
-import plotly.graph_objects as go
-import random
 
 # --- 1. CONFIGURATION & STYLING ---
 st.set_page_config(
@@ -111,7 +108,7 @@ class HeuristicEngine:
     """AI-lite logic for scoring links and pruning."""
     
     def __init__(self, target_title, precision_mode="Balanced"):
-        # --- FIX: Define stop_words FIRST ---
+        # --- FIX 1: Define stop_words FIRST ---
         self.stop_words = {"the", "of", "and", "in", "to", "a", "is", "for", "on", "by", "with"}
         
         # Now we can safely call tokenize
@@ -129,7 +126,6 @@ class HeuristicEngine:
     def _tokenize(self, text):
         """Simple tokenizer."""
         clean = text.lower().replace("_", " ")
-        # This line was failing because self.stop_words wasn't defined yet
         return [w for w in clean.split() if w.isalnum() and w not in self.stop_words]
 
     def is_pruned(self, title):
@@ -178,44 +174,56 @@ class HeuristicEngine:
         
         return max(0.1, score)
 
-# --- 4. NETWORK LAYER ---
+# --- 4. NETWORK LAYER (UPDATED) ---
 
 class WikiSession:
-    """Manages HTTP connections with caching and rate limits."""
+    """Manages HTTP connections with caching, rate limits, and retries."""
     def __init__(self):
         self.session = requests.Session()
-        self.session.headers = {'User-Agent': 'WikiNavElite/2.0 (Education/Research)'}
+        # Use a browser-like User-Agent to avoid being blocked by Wikipedia
+        self.session.headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
+        }
         self.api_url = "https://en.wikipedia.org/api/rest_v1/page/html/"
-        self.cache = {} # Simple in-memory cache
+        self.cache = {} 
 
     def fetch_links(self, title):
         """Fetches page and extracts all valid internal links."""
         if title in self.cache:
             return self.cache[title], True # Cached
         
-        try:
-            url = f"{self.api_url}{quote(title)}"
-            response = self.session.get(url, timeout=3)
-            response.raise_for_status()
+        # --- FIX 2: Retry mechanism ---
+        for attempt in range(3):
+            try:
+                url = f"{self.api_url}{quote(title)}"
+                # Increased timeout to 10 seconds to handle slow connections
+                response = self.session.get(url, timeout=10) 
+                
+                if response.status_code == 404:
+                    return [], False
+                
+                response.raise_for_status()
+                
+                soup = BeautifulSoup(response.text, 'html.parser')
+                links = []
+                
+                for a in soup.find_all('a', href=True):
+                    href = a['href']
+                    if href.startswith('./') and ':' not in href[2:]:
+                        clean_ref = unquote(href[2:].split('#')[0])
+                        link_text = a.get_text()
+                        links.append((clean_ref, link_text))
+                
+                unique_links = list(dict.fromkeys(links))
+                self.cache[title] = unique_links
+                return unique_links, False
             
-            soup = BeautifulSoup(response.text, 'html.parser')
-            links = []
-            
-            # Extract links with their anchor text for heuristic scoring
-            for a in soup.find_all('a', href=True):
-                href = a['href']
-                if href.startswith('./') and ':' not in href[2:]:
-                    clean_ref = unquote(href[2:].split('#')[0])
-                    link_text = a.get_text()
-                    links.append((clean_ref, link_text))
-            
-            # Deduplicate preserving order
-            unique_links = list(dict.fromkeys(links))
-            self.cache[title] = unique_links
-            return unique_links, False
-            
-        except Exception as e:
-            return [], False
+            except requests.exceptions.RequestException:
+                if attempt == 2:
+                    return [], False
+                time.sleep(1) # Wait before retrying
+                
+        return [], False
 
 # --- 5. SEARCH ENGINE (BIDIRECTIONAL) ---
 
@@ -226,7 +234,6 @@ class PathFinder:
         self.session = WikiSession()
         self.telemetry = Telemetry()
         self.heuristics = HeuristicEngine(self.end, mode)
-        self.max_threads = max_threads
         
         # Configuration based on mode
         modes = {
@@ -242,11 +249,9 @@ class PathFinder:
         Implements Bidirectional Best-First Search.
         """
         # Data Structures
-        # Queue item: (Priority, Depth, Title)
         f_queue = [(0, 0, self.start)] 
         b_queue = [(0, 0, self.end)]
         
-        # Parents: {child: parent}
         f_parents = {self.start: None}
         b_parents = {self.end: None}
         
@@ -258,29 +263,27 @@ class PathFinder:
         while f_queue and b_queue:
             step_count += 1
             
-            # 1. Decide Direction (Always expand smaller frontier for efficiency)
+            # 1. Decide Direction (Always expand smaller frontier)
             if len(f_queue) <= len(b_queue):
                 direction = "Forward"
                 active_q = f_queue
                 active_visited = visited_f
                 active_parents = f_parents
                 opposing_visited = visited_b
-                opposing_parents = b_parents
             else:
                 direction = "Backward"
                 active_q = b_queue
                 active_visited = visited_b
                 active_parents = b_parents
                 opposing_visited = visited_f
-                opposing_parents = f_parents
 
             self.telemetry.active_direction = direction
             
-            # 2. Pop Best Candidate (Priority Queue)
+            # 2. Pop Best Candidate
             try:
                 prio, depth, current = heapq.heappop(active_q)
             except IndexError:
-                break # Queue exhausted
+                break
             
             # Depth check
             if depth >= self.config["depth"]:
@@ -320,18 +323,17 @@ class PathFinder:
                 score = self.heuristics.score_link(link_title, link_text)
                 valid_candidates.append((score, link_title))
 
-            # 5. Add to Queue (Beam Search - limit number of children added)
-            # Sort by score, take top N
+            # 5. Add to Queue (Beam Search)
             valid_candidates.sort(key=lambda x: x[0])
             top_candidates = valid_candidates[:self.config["beam"]]
             
             for score, title in top_candidates:
                 active_visited.add(title)
                 active_parents[title] = current
-                heapq.heappush(active_q, (score + depth, depth + 1, title)) # A* cost: g(n) + h(n)
+                heapq.heappush(active_q, (score + depth, depth + 1, title))
             
             # Log specific event
-            if step_count % 2 == 0: # Reduce log noise
+            if step_count % 2 == 0:
                 best_link = top_candidates[0][1] if top_candidates else "None"
                 self.telemetry.log(f"Expanded: {current[:20]}... | Best: {best_link[:15]}... | Q: {len(active_q)}")
 
@@ -358,14 +360,7 @@ class PathFinder:
             path_end.append(curr)
             curr = b_parents.get(curr)
         
-        # Join (removing duplicate meeting point)
-        if direction == "Forward":
-            # path_start ends with meet_node
-            # path_end starts with connection_node (which IS meet_node's child/neighbor logic in bidirectional is tricky)
-            # Actually, in this logic: meet_node (current) -> connection_node (already in other set)
-            return path_start + path_end
-        else:
-            return path_start + path_end
+        return path_start + path_end
 
 # --- 6. UI COMPONENT LAYOUT ---
 
@@ -384,7 +379,7 @@ def main():
         st.info("TF-IDF Keyword Matching")
         
         st.markdown("---")
-        st.caption("v2.4.0-Elite | Python 3.10+")
+        st.caption("v2.5.0-Final | Python 3.10+")
 
     # --- Main Header ---
     st.markdown("""
@@ -399,7 +394,7 @@ def main():
     # --- Input Section ---
     c1, c2, c3 = st.columns([2, 2, 1])
     with c1:
-        start_input = st.text_input("START POINT", "Python (programming language)")
+        start_input = st.text_input("START POINT", "Potato")
     with c2:
         end_input = st.text_input("TARGET DESTINATION", "Artificial intelligence")
     with c3:
@@ -411,7 +406,6 @@ def main():
     if 'searching' not in st.session_state:
         st.session_state.searching = False
 
-    # Placeholders for Real-time Data
     metrics_ph = st.empty()
     logs_ph = st.empty()
     result_ph = st.empty()
@@ -419,8 +413,21 @@ def main():
     if run_btn:
         st.session_state.searching = True
         
+        # --- FIX 3: Auto-Capitalize Inputs ---
+        start_input = start_input.strip()
+        end_input = end_input.strip()
+        start_input = start_input[0].upper() + start_input[1:] if start_input else ""
+        end_input = end_input[0].upper() + end_input[1:] if end_input else ""
+
         # Initialize Engine
         finder = PathFinder(start_input, end_input, mode)
+
+        # --- FIX 4: Validate Connectivity First ---
+        with st.spinner("Verifying endpoints..."):
+            links, _ = finder.session.fetch_links(finder.start)
+            if not links:
+                st.error(f"❌ Could not load start page: '{start_input}'. Check spelling or internet connection.")
+                st.stop()
         
         # Progress Bar
         progress_bar = st.progress(0)
@@ -432,7 +439,7 @@ def main():
                     telemetry = data
                     stats = telemetry.get_metrics()
                     
-                    # Update Metrics Panel (Custom HTML for speed/look)
+                    # Update Metrics Panel
                     metrics_html = f"""
                     <div style="display: flex; justify-content: space-between; margin-bottom: 10px;">
                         <div class="metric-card" style="width: 24%;">
@@ -459,7 +466,6 @@ def main():
                     log_text = "<br>".join([f"<span style='color: #00ff00;'>></span> {l}" for l in telemetry.logs[:8]])
                     logs_ph.markdown(f"<div class='log-container'>{log_text}</div>", unsafe_allow_html=True)
                     
-                    # Pulse Progress
                     progress_bar.progress(min(stats['scanned'] % 100, 100))
 
                 elif status == "FOUND":
@@ -467,10 +473,9 @@ def main():
                     st.balloons()
                     progress_bar.progress(100)
                     
-                    # Final Stats
                     total_time = finder.telemetry.get_metrics()['duration']
                     
-                    # --- Result Rendering ---
+                    # Result Rendering
                     result_html = f"""
                     <div style="background-color: #064e3b; padding: 20px; border-radius: 10px; border: 1px solid #059669; text-align: center; margin-top: 20px;">
                         <h2 style="color: #34d399; margin:0;">PATH ACQUIRED</h2>
@@ -479,14 +484,11 @@ def main():
                     """
                     result_ph.markdown(result_html, unsafe_allow_html=True)
                     
-                    # Visual Path Chain
                     st.write("")
                     st.subheader("📍 Trajectory")
                     
-                    # Generate Network Graph
-                    G = nx.DiGraph()
+                    # Visual Path Chain
                     for i in range(len(path)-1):
-                        G.add_edge(path[i], path[i+1])
                         st.markdown(f"""
                         <div style="padding: 10px; border-left: 3px solid #3b82f6; background: #1f2937; margin-bottom: 5px;">
                             <span style="color: #9ca3af; font-size: 12px;">Step {i}</span><br>
