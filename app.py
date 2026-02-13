@@ -30,6 +30,7 @@ st.markdown("""
         border-radius: 8px;
         color: white;
         text-align: center;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
     }
     .metric-value {
         font-size: 24px;
@@ -46,12 +47,13 @@ st.markdown("""
         font-family: 'Courier New', monospace;
         background-color: #000;
         color: #00ff00;
-        padding: 10px;
+        padding: 12px;
         border-radius: 5px;
-        height: 200px;
+        height: 250px;
         overflow-y: auto;
-        font-size: 12px;
+        font-size: 13px;
         border: 1px solid #333;
+        line-height: 1.6;
     }
     div.stButton > button {
         width: 100%;
@@ -59,6 +61,8 @@ st.markdown("""
         border: none;
         color: white;
         font-weight: bold;
+        padding: 0.5rem 1rem;
+        border-radius: 0.375rem;
     }
     /* Spinner override */
     .stSpinner > div {
@@ -81,11 +85,12 @@ class Telemetry:
         self.current_depth = 0
         self.active_direction = "Init"
         self.logs = []
-        self.max_logs = 50
+        self.max_logs = 100  # Increased log history
 
     def log(self, message, type="info"):
-        timestamp = f"[{time.time() - self.start_time:.2f}s]"
-        entry = f"{timestamp} {message}"
+        timestamp = f"{time.time() - self.start_time:.2f}s"
+        # Format: [Time] Message
+        entry = f"<span style='color:#6b7280'>[{timestamp}]</span> {message}"
         self.logs.insert(0, entry)
         if len(self.logs) > self.max_logs:
             self.logs.pop()
@@ -108,8 +113,8 @@ class HeuristicEngine:
     """AI-lite logic for scoring links and pruning."""
     
     def __init__(self, target_title, precision_mode="Balanced"):
-        # --- FIX 1: Define stop_words FIRST ---
-        self.stop_words = {"the", "of", "and", "in", "to", "a", "is", "for", "on", "by", "with"}
+        # Define stop_words FIRST
+        self.stop_words = {"the", "of", "and", "in", "to", "a", "is", "for", "on", "by", "with", "from", "at"}
         
         # Now we can safely call tokenize
         self.target_tokens = set(self._tokenize(target_title))
@@ -120,7 +125,7 @@ class HeuristicEngine:
         self.filter_patterns = [
             r"^Category:", r"^File:", r"^Template:", r"^Talk:", r"^User:", 
             r"^Wikipedia:", r"^Help:", r"^Portal:", r"^Special:", r"^List_of",
-            r"^\d{4}$", r"^\d{4}_in_", r"^ISBN_", r"^Main_Page$"
+            r"^\d{4}$", r"^\d{4}_in_", r"^ISBN_", r"^Main_Page$", r"^Index_of"
         ]
 
     def _tokenize(self, text):
@@ -144,7 +149,7 @@ class HeuristicEngine:
     def score_link(self, link_title, link_text):
         """
         Assign a priority score (lower is better for Priority Queue).
-        We invert logic here: High relevance = Low Score (0 is best).
+        0.0 = Perfect Match
         """
         score = 50.0 # Base score (neutral)
         
@@ -163,7 +168,6 @@ class HeuristicEngine:
             score -= (overlap * 10) # Heavy bonus for sharing words
             
         # 3. Contextual Bonus
-        # If the link text itself contains target keywords
         text_tokens = set(self._tokenize(text_clean))
         text_overlap = len(text_tokens.intersection(self.target_tokens))
         score -= (text_overlap * 2)
@@ -174,13 +178,13 @@ class HeuristicEngine:
         
         return max(0.1, score)
 
-# --- 4. NETWORK LAYER (UPDATED) ---
+# --- 4. NETWORK LAYER ---
 
 class WikiSession:
     """Manages HTTP connections with caching, rate limits, and retries."""
     def __init__(self):
         self.session = requests.Session()
-        # Use a browser-like User-Agent to avoid being blocked by Wikipedia
+        # Browser-like User-Agent
         self.session.headers = {
             'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.114 Safari/537.36'
         }
@@ -192,11 +196,10 @@ class WikiSession:
         if title in self.cache:
             return self.cache[title], True # Cached
         
-        # --- FIX 2: Retry mechanism ---
+        # Retry mechanism
         for attempt in range(3):
             try:
                 url = f"{self.api_url}{quote(title)}"
-                # Increased timeout to 10 seconds to handle slow connections
                 response = self.session.get(url, timeout=10) 
                 
                 if response.status_code == 404:
@@ -235,7 +238,7 @@ class PathFinder:
         self.telemetry = Telemetry()
         self.heuristics = HeuristicEngine(self.end, mode)
         
-        # Configuration based on mode
+        # Configuration
         modes = {
             "Fast": {"depth": 3, "beam": 15},
             "Balanced": {"depth": 4, "beam": 30},
@@ -263,7 +266,7 @@ class PathFinder:
         while f_queue and b_queue:
             step_count += 1
             
-            # 1. Decide Direction (Always expand smaller frontier)
+            # 1. Decide Direction
             if len(f_queue) <= len(b_queue):
                 direction = "Forward"
                 active_q = f_queue
@@ -285,6 +288,20 @@ class PathFinder:
             except IndexError:
                 break
             
+            # --- LOGGING UPDATE: Show exactly which link was clicked ---
+            parent = active_parents.get(current)
+            if parent:
+                # Truncate for cleaner UI
+                p_clean = (parent[:20] + '..') if len(parent) > 20 else parent
+                c_clean = (current[:20] + '..') if len(current) > 20 else current
+                
+                if direction == "Forward":
+                    self.telemetry.log(f"From <b>[{p_clean}]</b> ➡️ Clicked <b>[{c_clean}]</b>")
+                else:
+                    self.telemetry.log(f"Backtracking: <b>[{c_clean}]</b> ⬅️ Found in <b>[{p_clean}]</b>")
+            else:
+                self.telemetry.log(f"🚀 Started Search at <b>[{current}]</b>")
+
             # Depth check
             if depth >= self.config["depth"]:
                 continue
@@ -292,7 +309,6 @@ class PathFinder:
             # 3. Fetch Links
             raw_links, is_cached = self.session.fetch_links(current)
             
-            # Telemetry updates
             self.telemetry.requests_sent += 1 if not is_cached else 0
             self.telemetry.cache_hits += 1 if is_cached else 0
             self.telemetry.pages_scanned += 1
@@ -302,11 +318,11 @@ class PathFinder:
             valid_candidates = []
             
             for link_title, link_text in raw_links:
-                link_title = link_title.replace("_", " ") # Normalize
+                link_title = link_title.replace("_", " ") 
                 
                 # Check Intersection (Success!)
                 if link_title in opposing_visited:
-                    self.telemetry.log(f"🔗 CONNECTION FOUND AT: {link_title}", "success")
+                    self.telemetry.log(f"🎉 <b>CONNECTION FOUND:</b> [{link_title}]", "success")
                     path = self._reconstruct_path(current, link_title, f_parents, b_parents, direction)
                     yield "FOUND", path
                     return
@@ -323,7 +339,7 @@ class PathFinder:
                 score = self.heuristics.score_link(link_title, link_text)
                 valid_candidates.append((score, link_title))
 
-            # 5. Add to Queue (Beam Search)
+            # 5. Add to Queue
             valid_candidates.sort(key=lambda x: x[0])
             top_candidates = valid_candidates[:self.config["beam"]]
             
@@ -332,11 +348,6 @@ class PathFinder:
                 active_parents[title] = current
                 heapq.heappush(active_q, (score + depth, depth + 1, title))
             
-            # Log specific event
-            if step_count % 2 == 0:
-                best_link = top_candidates[0][1] if top_candidates else "None"
-                self.telemetry.log(f"Expanded: {current[:20]}... | Best: {best_link[:15]}... | Q: {len(active_q)}")
-
             # Yield control back to UI
             yield "UPDATE", self.telemetry
 
@@ -370,16 +381,10 @@ def main():
         st.title("⚙️ Control Center")
         
         mode = st.radio("Search Mode", ["Fast", "Balanced", "Deep"], index=1,
-                        help="Fast: Depth 3, High Pruning. Deep: Depth 6, Low Pruning.")
+                        help="Fast: Depth 3. Balanced: Depth 4. Deep: Depth 6.")
         
         st.markdown("---")
-        st.markdown("**Search Algorithm**")
-        st.info("Bidirectional Best-First Search")
-        st.markdown("**Heuristic Model**")
-        st.info("TF-IDF Keyword Matching")
-        
-        st.markdown("---")
-        st.caption("v2.5.0-Final | Python 3.10+")
+        st.caption("v2.6.0-Final | Python 3.10+")
 
     # --- Main Header ---
     st.markdown("""
@@ -413,7 +418,7 @@ def main():
     if run_btn:
         st.session_state.searching = True
         
-        # --- FIX 3: Auto-Capitalize Inputs ---
+        # Auto-Capitalize Inputs
         start_input = start_input.strip()
         end_input = end_input.strip()
         start_input = start_input[0].upper() + start_input[1:] if start_input else ""
@@ -422,7 +427,7 @@ def main():
         # Initialize Engine
         finder = PathFinder(start_input, end_input, mode)
 
-        # --- FIX 4: Validate Connectivity First ---
+        # Validate Connectivity First
         with st.spinner("Verifying endpoints..."):
             links, _ = finder.session.fetch_links(finder.start)
             if not links:
@@ -462,8 +467,8 @@ def main():
                     """
                     metrics_ph.markdown(metrics_html, unsafe_allow_html=True)
                     
-                    # Update Logs
-                    log_text = "<br>".join([f"<span style='color: #00ff00;'>></span> {l}" for l in telemetry.logs[:8]])
+                    # Update Logs (NOW SHOWS: From A -> Clicked B)
+                    log_text = "<br>".join([f"{l}" for l in telemetry.logs[:12]])
                     logs_ph.markdown(f"<div class='log-container'>{log_text}</div>", unsafe_allow_html=True)
                     
                     progress_bar.progress(min(stats['scanned'] % 100, 100))
@@ -491,9 +496,9 @@ def main():
                     for i in range(len(path)-1):
                         st.markdown(f"""
                         <div style="padding: 10px; border-left: 3px solid #3b82f6; background: #1f2937; margin-bottom: 5px;">
-                            <span style="color: #9ca3af; font-size: 12px;">Step {i}</span><br>
+                            <span style="color: #9ca3af; font-size: 12px;">Step {i} (On page "{path[i]}" clicked link:)</span><br>
                             <a href="https://en.wikipedia.org/wiki/{path[i].replace(' ', '_')}" target="_blank" style="color: white; font-weight: bold; text-decoration: none; font-size: 18px;">
-                                {path[i]}
+                                {path[i]} ⬇
                             </a>
                         </div>
                         """, unsafe_allow_html=True)
@@ -501,7 +506,7 @@ def main():
                     # Final Target
                     st.markdown(f"""
                         <div style="padding: 10px; border-left: 3px solid #10b981; background: #1f2937;">
-                            <span style="color: #9ca3af; font-size: 12px;">TARGET</span><br>
+                            <span style="color: #9ca3af; font-size: 12px;">TARGET REACHED</span><br>
                             <a href="https://en.wikipedia.org/wiki/{path[-1].replace(' ', '_')}" target="_blank" style="color: #34d399; font-weight: bold; text-decoration: none; font-size: 18px;">
                                 {path[-1]}
                             </a>
