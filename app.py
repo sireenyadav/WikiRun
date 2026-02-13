@@ -111,6 +111,10 @@ class HeuristicEngine:
     """AI-lite logic for scoring links and pruning."""
     
     def __init__(self, target_title, precision_mode="Balanced"):
+        # --- FIX: Define stop_words FIRST ---
+        self.stop_words = {"the", "of", "and", "in", "to", "a", "is", "for", "on", "by", "with"}
+        
+        # Now we can safely call tokenize
         self.target_tokens = set(self._tokenize(target_title))
         self.target_title_clean = target_title.lower().replace("_", " ")
         self.precision_mode = precision_mode
@@ -121,13 +125,11 @@ class HeuristicEngine:
             r"^Wikipedia:", r"^Help:", r"^Portal:", r"^Special:", r"^List_of",
             r"^\d{4}$", r"^\d{4}_in_", r"^ISBN_", r"^Main_Page$"
         ]
-        
-        # Stop words to ignore in token matching
-        self.stop_words = {"the", "of", "and", "in", "to", "a", "is", "for", "on", "by", "with"}
 
     def _tokenize(self, text):
         """Simple tokenizer."""
         clean = text.lower().replace("_", " ")
+        # This line was failing because self.stop_words wasn't defined yet
         return [w for w in clean.split() if w.isalnum() and w not in self.stop_words]
 
     def is_pruned(self, title):
